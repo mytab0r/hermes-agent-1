@@ -551,6 +551,89 @@ def test_respawn_guard_ignores_auth_words_in_crashed_worker_output(kanban_home):
         assert kbd.check_respawn_guard(conn, spawn_failed_id) == "blocker_auth"
 
 
+def test_respawn_guard_ignores_workspace_prep_eacces(kanban_home, monkeypatch):
+    """A workspace the host could not prepare is not an auth wall.
+
+    ``git worktree add`` failing with ``cannot lock ref ... Permission denied``
+    persists ``workspace: ...`` as ``last_failure_error``. ``permission denied``
+    is in ``_RESPAWN_BLOCKER_RE``, so the guard used to answer
+    ``blocker_auth`` and park the card forever (t_619efc27: ready 4.4h, 25x
+    ``respawn_guarded reason=blocker_auth``), while a manual retry on the same
+    card worked. The workspace path must yield the infrastructure cooldown, not
+    the auth blocker.
+    """
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "0")
+
+    workspace_err = (
+        "workspace: git worktree add failed: fatal: cannot lock ref "
+        "'refs/heads/aicontent-factory/t_619efc27': Unable to create "
+        "'/opt/data/projects/x/.git/refs/heads/aicontent-factory/t_619efc27.lock': "
+        "Permission denied"
+    )
+    with kbc.connect() as conn:
+        def _spawn_failed(error_text: str) -> str:
+            tid = kb.create_task(conn, title="spawn failed", assignee="a")
+            kb.claim_task(conn, tid)
+            run_id = kb.get_task(conn, tid).current_run_id
+            conn.execute(
+                "UPDATE task_runs SET outcome='spawn_failed', status='failed', ended_at=? "
+                "WHERE id=?",
+                (int(time.time()) - 5, run_id),
+            )
+            conn.execute(
+                "UPDATE tasks SET status='ready', current_run_id=NULL, claim_lock=NULL, "
+                "claim_expires=NULL, worker_pid=NULL, last_failure_error=? WHERE id=?",
+                (error_text, tid),
+            )
+            conn.commit()
+            return tid
+
+        tid = _spawn_failed(workspace_err)
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+        # Regression: the same "permission denied" text outside the workspace
+        # prefix is a real provider auth wall and still parks the card.
+        auth_tid = _spawn_failed("provider error: 403 permission denied (invalid api key)")
+        assert kbd.check_respawn_guard(conn, auth_tid) == "blocker_auth"
+
+
+def test_workspace_prep_eacces_never_charges_the_card(
+    kanban_home, monkeypatch, all_assignees_spawnable,
+):
+    """End-to-end through the real dispatcher: a workspace the host refuses to
+    prepare keeps the card retryable (no retry budget, no ``blocker_auth``)."""
+    monkeypatch.setenv("HERMES_KANBAN_RATE_LIMIT_COOLDOWN_SECONDS", "300")
+
+    def broken_resolve(task, *, board=None):
+        raise RuntimeError(
+            "git worktree add failed: fatal: cannot lock ref 'refs/heads/x': "
+            "Unable to create '/repo/.git/refs/heads/x.lock': Permission denied"
+        )
+
+    monkeypatch.setattr(kbd._kbw, "_resolve_worktree_workspace", broken_resolve)
+
+    with kbc.connect() as conn:
+        tid = kb.create_task(conn, title="worktree eacces", assignee="a", workspace_kind="worktree")
+        for _ in range(3):
+            res = kbd.dispatch_once(conn, spawn_fn=lambda *a, **k: 1, failure_limit=2)
+            assert res.auto_blocked == []
+            assert res.spawned == []
+        row = conn.execute(
+            "SELECT status, consecutive_failures, last_failure_error FROM tasks WHERE id = ?", (tid,),
+        ).fetchone()
+        assert row["status"] == "ready"
+        assert row["consecutive_failures"] == 0
+        assert row["last_failure_error"].startswith("workspace: ")
+        runs = conn.execute(
+            "SELECT outcome, metadata FROM task_runs WHERE task_id = ? ORDER BY id", (tid,),
+        ).fetchall()
+        assert [r["outcome"] for r in runs] == ["spawn_failed"] * 3
+        assert all(json.loads(r["metadata"])["infrastructure"] is True for r in runs)
+        # Not parked as an auth wall, and not spaced by the host-refusal cooldown
+        # either: the git lock is transient, the next tick retries.
+        assert kbd.check_respawn_guard(conn, tid) is None
+
+
 def test_infrastructure_spawn_refusal_never_charges_the_card(
     kanban_home, monkeypatch, all_assignees_spawnable,
 ):
