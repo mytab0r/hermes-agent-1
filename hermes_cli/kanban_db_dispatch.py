@@ -70,6 +70,20 @@ _RESPAWN_BLOCKER_RE = re.compile(
     re.IGNORECASE,
 )
 
+# The dispatcher prefixes a workspace-preparation failure with this marker
+# (``workspace: git worktree add failed ...``). It is the host's problem — a
+# checkout it cannot lock or write to — not the card's: the same card works on
+# the next tick once the host is sane (t_619efc27 sat ready 4.4h on 25
+# ``respawn_guarded reason=blocker_auth`` for a ``cannot lock ref ... Permission
+# denied`` from ``git worktree add``). Its text routinely carries "permission
+# denied", which _RESPAWN_BLOCKER_RE would read as an auth wall.
+_WORKSPACE_FAILURE_PREFIX = "workspace:"
+
+
+def _is_workspace_failure(err: str) -> bool:
+    return err.lstrip().lower().startswith(_WORKSPACE_FAILURE_PREFIX)
+
+
 # Within this window a completed run counts as "recent proof"; don't re-spawn.
 _RESPAWN_GUARD_SUCCESS_WINDOW = 3600  # 1 hour
 
@@ -1517,6 +1531,7 @@ def check_respawn_guard(
         return None
 
     now = int(time.time())
+    err = _kb._lossy_text(row["last_failure_error"])
 
     # 1. Rate-limit cooldown — see docstring for why this precedes blocker_auth.
     #    LATEST run only: a newer crash/completion supersedes the rate-limit run.
@@ -1531,7 +1546,14 @@ def check_respawn_guard(
         (task_id,),
     ).fetchone()
     if latest_run is not None and latest_run["outcome"] == "spawn_failed":
-        if rl_cooldown > 0 and _kb._json_dict(latest_run["metadata"]).get("infrastructure"):
+        # A workspace the host could not prepare clears on the next tick (a git
+        # lock is transient), so it is retried without the cooldown; only a host
+        # that refuses to place an otherwise-ready worker needs spacing.
+        if (
+            rl_cooldown > 0
+            and _kb._json_dict(latest_run["metadata"]).get("infrastructure")
+            and not _is_workspace_failure(err or "")
+        ):
             ended_at = latest_run["ended_at"]
             if ended_at is not None and (now - int(ended_at)) < rl_cooldown:
                 return "infrastructure_cooldown"
@@ -1552,9 +1574,18 @@ def check_respawn_guard(
     # crash is different: its persisted error includes the worker's last
     # captured output, which is context rather than a diagnosis and may contain
     # benign commands such as ``claude auth status`` (#117097).
-    err = _kb._lossy_text(row["last_failure_error"])
     latest_outcome = latest_run["outcome"] if latest_run is not None else None
-    if err and latest_outcome != "crashed" and _RESPAWN_BLOCKER_RE.search(err):
+    # An infrastructure spawn failure is the host's verdict, not the card's: its
+    # text is host noise ("permission denied" on a worktree lock), so it can
+    # never be read as an auth wall either.
+    if (
+        err
+        and latest_outcome != "crashed"
+        and not _is_workspace_failure(err)
+        and not (latest_outcome == "spawn_failed"
+                 and _kb._json_dict(latest_run["metadata"]).get("infrastructure"))
+        and _RESPAWN_BLOCKER_RE.search(err)
+    ):
         return "blocker_auth"
 
     # Review-lane spawns stop here: a recent completed run and a fresh PR URL
@@ -2059,9 +2090,14 @@ def _dispatch_lane_task(
         else:
             workspace = _kbw.resolve_workspace(claimed, board=board)
     except Exception as exc:
+        # A workspace the host cannot prepare (EACCES on a worktree lock, a
+        # repo owned by another uid) is an infrastructure condition, exactly
+        # like a refused spawn: the card never ran, so it must not spend the
+        # card's retry budget — retry forever, spaced by the cooldown.
         if _record_task_failure(
             conn, claimed.id, f"workspace: {exc}",
             outcome="spawn_failed", failure_limit=failure_limit, release_claim=True, end_run=True,
+            infrastructure=True,
         ):
             result.auto_blocked.append(claimed.id)
         return False
